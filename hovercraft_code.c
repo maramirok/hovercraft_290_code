@@ -1,10 +1,9 @@
 /*
   Hovercraft Control: "The Navigator" (PURE C VERSION)
-  TURN UPGRADE v14: Left-turn ANTI-STALL fix. Full-lock vane (1750) was stalling on left turns
-  -> thrust deflected backward -> craft slid back instead of rotating. Left turn now uses a
-  gentler throw (SERVO_LEFT_TURN_US), floats higher (FAN_LIFT_TURN_LEFT raised), and no longer
-  pins the vane through the turn (CTR_STEER_LEFT = 0). Scan still uses full throw to aim the
-  sensor. INT0 ultrasonic + SCAN_SIDES stuck-state fix retained.
+  TURN UPGRADE v18: Earlier slow-down / more wall clearance. Craft was coasting into the wall
+  and getting wedged on it (shape, not sensor). Now starts slowing sooner (SLOW_CM raised),
+  commits to the turn further out (TURN_CM raised), and creeps slower (FAN_DIR_SLOW lowered) so
+  it stops with room to turn. 180deg symmetric turns, servo mirror, PI steering, INT0 retained.
 */
 
 #define F_CPU 16000000UL
@@ -20,14 +19,11 @@
 #define LED_PIN        PB5
 #define SERVO_PIN      PB1
 
+// Logical-frame servo pulses. Servo is physically rotated 180deg; output is mirrored about
+// center at the OCR1A write, so these logical values still mean what they say.
 const int SERVO_CENTER_US = 3150;
-const int SERVO_LEFT_US   = 1750;   // full-left throw (used by the SCAN to aim the sensor sideways)
+const int SERVO_LEFT_US   = 1750;
 const int SERVO_RIGHT_US  = 4500;
-
-// Left TURN uses a gentler throw than the scan, so the vane vectors thrust SIDEWAYS (rotation)
-// without STALLING. Full lock (1750) stalls -> thrust goes backward -> craft slides back.
-const int SERVO_LEFT_TURN_US = 2000;  // RAISE toward 2700 if it still slides; LOWER toward 1900
-                                      //   if it rotates too weakly to beat the counter-torque.
 
 volatile int servoPulseWidth = SERVO_CENTER_US;
 int targetPulse = SERVO_CENTER_US;
@@ -37,33 +33,33 @@ volatile uint32_t timer0_millis = 0;
 
 #define MPU6050_ADDR 0x68
 const int FAN_DIR_FULL = 255;
-const int FAN_LIFT_90  = 230;   // normal cruise lift
+const int FAN_LIFT_90  = 230;
 const int FAN_STOP = 0;
 
 // ===== turn tuning knobs =====
-const int FAN_LIFT_TURN      = 50;   // deflate for RIGHT spin + scan. If it still slides: 30, then 0.
-const int FAN_LIFT_TURN_LEFT = 60;   // raised from 20: float enough to PIVOT. Too low let it slide.
-const uint32_t SCAN_SETTLE_MS = 200; // settle after sensor arrives at each side before measuring
-const uint32_t SCAN_MAX_MS    = 1500;// HARD timeout per scan phase: never hang waiting to "arrive"
+const int FAN_LIFT_TURN      = 50;
+const uint32_t SCAN_SETTLE_MS = 200;
+const uint32_t SCAN_MAX_MS    = 1500;
+const uint32_t TURN_MAX_MS    = 4500;
 
-// --- two-stage wall trigger (breaks the early-turn vs ramming deadlock) ---
-const int32_t SLOW_CM      = 35;     // notice the wall here -> slow approach (early warning)
-const int32_t TURN_CM      = 18;     // commit to scan/turn here (close to the wall)
-const int     FAN_DIR_SLOW = 150;    // reduced thrust during slow approach AND straighten
+// --- two-stage wall trigger (raised for more stopping clearance: it was wedging on the wall) ---
+const int32_t SLOW_CM      = 45;     // start slowing here (was 35): begin the slow approach sooner
+const int32_t TURN_CM      = 28;     // commit to scan/turn here (was 18): stop further from the wall
+const int     FAN_DIR_SLOW = 110;    // slow-approach thrust (was 150): creep slower -> stops in less distance
 
-// --- post-turn straighten (settle heading before detecting again) ---
-const uint32_t STRAIGHTEN_MAX_MS = 500; // safety timeout so it can't hang if heading won't fully settle
+// --- post-turn straighten ---
+const uint32_t STRAIGHTEN_MAX_MS = 500;
 
-// --- spin thrust (LEVER 3) ---
-const int FAN_DIR_TURN_RIGHT = 255;  // full thrust during right spin
-const int FAN_DIR_TURN_LEFT  = 255;  // structural only -- left already at the 255 ceiling.
+// --- turn drive (symmetric) ---
+const int32_t TURN_LEAD    = 6000;   // 180deg overshoot knob -- raise if it sails past 180.
+const int     CTR_STEER_US = 1800;
 
-// --- RIGHT turn (torque assists): brake harder, lead more ---
-const int32_t TURN_LEAD      = 5000;
-const int     CTR_STEER_US   = 1800;
-// --- LEFT turn (torque fights the spin) ---
-const int32_t TURN_LEAD_LEFT = 500;
-const int     CTR_STEER_LEFT = 0;    // was -800: stop pinning the vane at full throw through the turn.
+// --- steering gains ---
+const int32_t Kp = 30;
+// --- integral (I) term: cancels steady straight-line drift (tail-walk on the straights) ---
+const int32_t Ki          = 2;     // START LOW. Raise if drift persists; LOWER if it starts weaving.
+const int32_t I_CLAMP     = 8000;  // anti-windup: cap on the accumulated error sum.
+const int     I_OUT_CLAMP = 600;   // safety cap on rudder offset (us) the I term can ever apply.
 // =============================
 
 int32_t yaw = 0;
@@ -72,8 +68,9 @@ uint32_t previousTime = 0, currentTime = 0;
 uint32_t settleStart = 0;
 uint32_t straightenStart = 0;
 uint32_t scanStart = 0;
+uint32_t turnStart = 0;
 
-const int32_t Kp = 30;
+int32_t yawIntegral = 0;   // accumulated heading error -- straight-line states ONLY
 
 // scan state
 int scanPhase = 0;
@@ -82,12 +79,11 @@ int32_t leftOpen = 0, rightOpen = 0;
 
 // ================= Ultrasonic via INT0 (PD2), non-blocking timing =================
 volatile uint32_t timer0_overflows = 0;
-volatile uint8_t  echoState = 0;           // 0=idle, 1=waiting for rising, 2=timing high pulse
+volatile uint8_t  echoState = 0;
 volatile uint32_t echoStartUs = 0;
 volatile uint32_t echoWidthUs = 0;
 volatile uint8_t  echoReady = 0;
 
-// At 16MHz with /64 prescale: 1 tick = 4us, 256 ticks = 1024us per overflow.
 static inline uint32_t micros_now(void) {
     uint32_t ov;
     uint8_t  t;
@@ -101,17 +97,16 @@ static inline uint32_t micros_now(void) {
 }
 
 ISR(TIMER0_OVF_vect) {
-    timer0_millis++;        // ticks every ~1.024ms with the /64 prescale
+    timer0_millis++;
     timer0_overflows++;
 }
 
-// INT0 = PD2 = echo. Fires on every logic change (rising AND falling edge).
 ISR(INT0_vect) {
     uint32_t now = micros_now();
-    if (PIND & (1 << PD2)) {        // rising edge: echo started
+    if (PIND & (1 << PD2)) {
         echoStartUs = now;
         echoState = 2;
-    } else {                         // falling edge: echo ended
+    } else {
         if (echoState == 2) {
             echoWidthUs = now - echoStartUs;
             echoReady = 1;
@@ -135,8 +130,6 @@ void trig_pulse(void) {
     PORTB &= ~(1 << PB3);
 }
 
-// Fire a ping, then poll the ISR's "ready" flag (bounded). Echo TIMING is done in the ISR;
-// this just collects the finished result. /58 -> cm scale identical to the old code.
 int32_t us_sensor_get_distance(void) {
     echoReady = 0;
     echoState = 1;
@@ -147,7 +140,7 @@ int32_t us_sensor_get_distance(void) {
         _delay_us(1);
         guard++;
     }
-    if (!echoReady) { echoState = 0; return 0; }   // no echo -> open / out of range
+    if (!echoReady) { echoState = 0; return 0; }
 
     uint32_t w = echoWidthUs;
     int32_t d = (int32_t)(w / 58UL);
@@ -195,8 +188,6 @@ void calculate_IMU_error() {
   PORTB &= ~(1 << PB5);
 }
 
-// "How open is this side." 0 (no echo) = open, so map it to a large value.
-// Median of 3 rejects single bad pings.
 int32_t read_open(void) {
     int32_t a = us_sensor_get_distance(); _delay_ms(20);
     int32_t b = us_sensor_get_distance(); _delay_ms(20);
@@ -206,10 +197,11 @@ int32_t read_open(void) {
     if (c == 0) c = 999;
     int32_t hi = (a > b) ? a : b; hi = (hi > c) ? hi : c;
     int32_t lo = (a < b) ? a : b; lo = (lo < c) ? lo : c;
-    return a + b + c - hi - lo;   // median
+    return a + b + c - hi - lo;
 }
 
-ISR(TIMER1_COMPA_vect){ OCR1A = servoPulseWidth; }
+// Servo physically rotated 180deg -> mirror the commanded pulse about center before output.
+ISR(TIMER1_COMPA_vect){ OCR1A = 2 * SERVO_CENTER_US - servoPulseWidth; }
 
 // ---------- States ----------
 enum SystemState {
@@ -221,28 +213,25 @@ enum SystemState {
 };
 SystemState systemState = CRUISE;
 
-int turnDirection = 1;     // +1 = right, -1 = left
+int turnDirection = 1;
 int32_t targetYaw = 0;
 
 int main(void) {
     I2C_init();
     MPU6050_init();
 
-    DDRB |= (1 << PB3);   // trig output
-    DDRD &= ~(1 << PD2);  // echo input (INT0)
+    DDRB |= (1 << PB3);
+    DDRD &= ~(1 << PD2);
     DDRB |= (1 << PB5);
     DDRD |= (1 << FAN_LIFT_PIN) | (1 << FAN_DIR_PIN);
 
-    // INT0 (PD2) on ANY logic change: catches both echo edges.
-    EICRA = (1 << ISC00);   // ISC01:ISC00 = 01 -> any edge
+    EICRA = (1 << ISC00);
     EIMSK = (1 << INT0);
 
-    // Timer0: Fast PWM for fans + overflow ISR for millis & us-clock (/64 prescale).
     TCCR0A = (1 << COM0A1) | (1 << COM0B1) | (1 << WGM01) | (1 << WGM00);
     TCCR0B = (1 << CS01) | (1 << CS00);
     TIMSK0 |= (1 << TOIE0);
 
-    // Timer1: 16-bit Fast PWM for the servo (unchanged).
     DDRB |= (1<<DDB1);
     TCCR1A=0; TCCR1B=0; TCNT1=0;
     ICR1=20000;
@@ -257,10 +246,9 @@ int main(void) {
 
     calculate_IMU_error();
 
-    // LAUNCH SEQUENCE (lift first, then thrust)
     OCR0A = FAN_STOP; OCR0B = FAN_STOP; _delay_ms(3000);
-    OCR0B = FAN_LIFT_90; OCR0A = FAN_STOP; _delay_ms(1500);   // pressurize
-    OCR0A = FAN_DIR_FULL;                                     // launch
+    OCR0B = FAN_LIFT_90; OCR0A = FAN_STOP; _delay_ms(1500);
+    OCR0A = FAN_DIR_FULL;
 
     previousTime = get_millis();
     currentTime = previousTime;
@@ -284,7 +272,17 @@ int main(void) {
                 OCR0B = FAN_LIFT_90;
 
                 int32_t error = targetYaw - yaw;
-                int correction = (int)((error * Kp) / 100);
+
+                yawIntegral += (error * (int32_t)delta_t) / 1000;
+                if (yawIntegral >  I_CLAMP) yawIntegral =  I_CLAMP;
+                if (yawIntegral < -I_CLAMP) yawIntegral = -I_CLAMP;
+
+                int pCorr = (int)((error * Kp) / 100);
+                int iCorr = (int)((yawIntegral * Ki) / 100);
+                if (iCorr >  I_OUT_CLAMP) iCorr =  I_OUT_CLAMP;
+                if (iCorr < -I_OUT_CLAMP) iCorr = -I_OUT_CLAMP;
+
+                int correction = pCorr + iCorr;
                 int newPulse = SERVO_CENTER_US + correction;
                 if (newPulse < SERVO_LEFT_US)  newPulse = SERVO_LEFT_US;
                 if (newPulse > SERVO_RIGHT_US) newPulse = SERVO_RIGHT_US;
@@ -309,7 +307,17 @@ int main(void) {
                 OCR0B = FAN_LIFT_90;
 
                 int32_t error = targetYaw - yaw;
-                int correction = (int)((error * Kp) / 100);
+
+                yawIntegral += (error * (int32_t)delta_t) / 1000;
+                if (yawIntegral >  I_CLAMP) yawIntegral =  I_CLAMP;
+                if (yawIntegral < -I_CLAMP) yawIntegral = -I_CLAMP;
+
+                int pCorr = (int)((error * Kp) / 100);
+                int iCorr = (int)((yawIntegral * Ki) / 100);
+                if (iCorr >  I_OUT_CLAMP) iCorr =  I_OUT_CLAMP;
+                if (iCorr < -I_OUT_CLAMP) iCorr = -I_OUT_CLAMP;
+
+                int correction = pCorr + iCorr;
                 int newPulse = SERVO_CENTER_US + correction;
                 if (newPulse < SERVO_LEFT_US)  newPulse = SERVO_LEFT_US;
                 if (newPulse > SERVO_RIGHT_US) newPulse = SERVO_RIGHT_US;
@@ -337,7 +345,7 @@ int main(void) {
                 OCR0B = FAN_LIFT_TURN;
 
                 if (scanPhase == 0) {
-                    targetPulse = SERVO_LEFT_US;          // full throw: aim sensor fully sideways
+                    targetPulse = SERVO_LEFT_US;
                     if (abs(servoPulseWidth - targetPulse) <= SERVO_SPEED ||
                         (get_millis() - scanStart) >= SCAN_MAX_MS) {
                         if (!scanArmed) { settleStart = get_millis(); scanArmed = 1; }
@@ -347,20 +355,21 @@ int main(void) {
                             scanStart = get_millis();
                         }
                     }
-                } else { // scanPhase == 1
-                    targetPulse = SERVO_RIGHT_US;         // full throw: aim sensor fully sideways
+                } else {
+                    targetPulse = SERVO_RIGHT_US;
                     if (abs(servoPulseWidth - targetPulse) <= SERVO_SPEED ||
                         (get_millis() - scanStart) >= SCAN_MAX_MS) {
                         if (!scanArmed) { settleStart = get_millis(); scanArmed = 1; }
                         else if (get_millis() - settleStart >= SCAN_SETTLE_MS) {
                             rightOpen = read_open();
 
-                            if (leftOpen > rightOpen) turnDirection = -1;  // LEFT
-                            else                      turnDirection = 1;   // RIGHT (tie default)
+                            if (leftOpen > rightOpen) turnDirection = -1;
+                            else                      turnDirection = 1;
 
-                            targetYaw += (9000 * turnDirection);   // 9000 = 90.00 degrees
+                            targetYaw += (18000 * turnDirection);   // 18000 = 180.00 degrees
                             targetPulse = SERVO_CENTER_US;
                             scanArmed = 0;
+                            turnStart = get_millis();
                             systemState = EXECUTE_TURN;
                         }
                     }
@@ -368,10 +377,10 @@ int main(void) {
                 break;
 
             case EXECUTE_TURN:
-                OCR0A = (turnDirection == 1) ? FAN_DIR_TURN_RIGHT : FAN_DIR_TURN_LEFT;
-                OCR0B = (turnDirection == 1) ? FAN_LIFT_TURN : FAN_LIFT_TURN_LEFT;
+                OCR0A = FAN_DIR_FULL;
+                OCR0B = FAN_LIFT_TURN;
 
-                if (turnDirection == 1) {                          // RIGHT: torque assists
+                if (turnDirection == 1) {                          // RIGHT
                     if (yaw < targetYaw - TURN_LEAD)
                         targetPulse = SERVO_RIGHT_US;
                     else
@@ -379,21 +388,29 @@ int main(void) {
 
                     if (yaw >= targetYaw) {
                         OCR0B = FAN_LIFT_90;
+                        yawIntegral = 0;
                         straightenStart = get_millis();
                         systemState = STRAIGHTEN;
                     }
-                } else {                                           // LEFT: torque fights us
-                    // gentler throw so the vane vectors thrust sideways instead of stalling.
-                    if (yaw > targetYaw + TURN_LEAD_LEFT)
-                        targetPulse = SERVO_LEFT_TURN_US;
+                } else {                                           // LEFT (mirror)
+                    if (yaw > targetYaw + TURN_LEAD)
+                        targetPulse = SERVO_LEFT_US;
                     else
-                        targetPulse = SERVO_CENTER_US + CTR_STEER_LEFT; // 0 -> center near the end
+                        targetPulse = SERVO_CENTER_US + CTR_STEER_US;
 
                     if (yaw <= targetYaw) {
                         OCR0B = FAN_LIFT_90;
+                        yawIntegral = 0;
                         straightenStart = get_millis();
                         systemState = STRAIGHTEN;
                     }
+                }
+
+                if (get_millis() - turnStart >= TURN_MAX_MS) {
+                    OCR0B = FAN_LIFT_90;
+                    yawIntegral = 0;
+                    straightenStart = get_millis();
+                    systemState = STRAIGHTEN;
                 }
                 break;
 
@@ -402,7 +419,17 @@ int main(void) {
                 OCR0B = FAN_LIFT_90;
 
                 int32_t error = targetYaw - yaw;
-                int correction = (int)((error * Kp) / 100);
+
+                yawIntegral += (error * (int32_t)delta_t) / 1000;
+                if (yawIntegral >  I_CLAMP) yawIntegral =  I_CLAMP;
+                if (yawIntegral < -I_CLAMP) yawIntegral = -I_CLAMP;
+
+                int pCorr = (int)((error * Kp) / 100);
+                int iCorr = (int)((yawIntegral * Ki) / 100);
+                if (iCorr >  I_OUT_CLAMP) iCorr =  I_OUT_CLAMP;
+                if (iCorr < -I_OUT_CLAMP) iCorr = -I_OUT_CLAMP;
+
+                int correction = pCorr + iCorr;
                 int newPulse = SERVO_CENTER_US + correction;
                 if (newPulse < SERVO_LEFT_US)  newPulse = SERVO_LEFT_US;
                 if (newPulse > SERVO_RIGHT_US) newPulse = SERVO_RIGHT_US;
@@ -423,7 +450,8 @@ int main(void) {
         } else {
             servoPulseWidth = targetPulse;
         }
-        OCR1A = servoPulseWidth;
+        // Servo physically rotated 180deg -> mirror the commanded pulse about center.
+        OCR1A = 2 * SERVO_CENTER_US - servoPulseWidth;
 
         _delay_ms(40);
     }
