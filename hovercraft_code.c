@@ -1,9 +1,13 @@
 /*
   Hovercraft Control: "The Navigator" (PURE C VERSION)
-  TURN UPGRADE v18: Earlier slow-down / more wall clearance. Craft was coasting into the wall
-  and getting wedged on it (shape, not sensor). Now starts slowing sooner (SLOW_CM raised),
-  commits to the turn further out (TURN_CM raised), and creeps slower (FAN_DIR_SLOW lowered) so
-  it stops with room to turn. 180deg symmetric turns, servo mirror, PI steering, INT0 retained.
+  TURN UPGRADE v19:
+    #1 PD TURN CONTROLLER -- replaces bang-bang+fixed-brake. Drives on remaining angle
+       (targetYaw - yaw) and brakes on rotation RATE (gyro). The D term eases off as it
+       spins toward target, so it approaches 90deg instead of overshooting.
+    #2 STUCK-AT-WALL ESCAPE -- craft was pinning itself against a wall, rudder STRAIGHT,
+       while the front reading failed to trigger (point-blank 0 / no change). Now if the
+       front distance stops changing while close for too long, force the scan/turn.
+  90deg symmetric turns, servo mirror, PI straight-line steering, INT0 ultrasonic retained.
 */
 
 #define F_CPU 16000000UL
@@ -19,8 +23,7 @@
 #define LED_PIN        PB5
 #define SERVO_PIN      PB1
 
-// Logical-frame servo pulses. Servo is physically rotated 180deg; output is mirrored about
-// center at the OCR1A write, so these logical values still mean what they say.
+// Logical-frame servo pulses. Servo physically rotated 180deg; output mirrored about center.
 const int SERVO_CENTER_US = 3150;
 const int SERVO_LEFT_US   = 1750;
 const int SERVO_RIGHT_US  = 4500;
@@ -40,26 +43,32 @@ const int FAN_STOP = 0;
 const int FAN_LIFT_TURN      = 50;
 const uint32_t SCAN_SETTLE_MS = 200;
 const uint32_t SCAN_MAX_MS    = 1500;
-const uint32_t TURN_MAX_MS    = 4500;
+const uint32_t TURN_MAX_MS    = 3000;  // escape hatch for the turn itself
 
-// --- two-stage wall trigger (raised for more stopping clearance: it was wedging on the wall) ---
-const int32_t SLOW_CM      = 45;     // start slowing here (was 35): begin the slow approach sooner
-const int32_t TURN_CM      = 28;     // commit to scan/turn here (was 18): stop further from the wall
-const int     FAN_DIR_SLOW = 110;    // slow-approach thrust (was 150): creep slower -> stops in less distance
+// --- two-stage wall trigger ---
+const int32_t SLOW_CM      = 45;
+const int32_t TURN_CM      = 28;
+const int     FAN_DIR_SLOW = 110;
+
+// --- #2 STUCK-AT-WALL escape ---
+const int32_t STUCK_CM      = 32;    // "close to a wall" band for the stuck-check
+const int32_t STUCK_DELTA   = 3;     // if front distance changes less than this (cm)...
+const uint32_t STUCK_MS     = 900;   // ...for this long while close, force the turn
 
 // --- post-turn straighten ---
 const uint32_t STRAIGHTEN_MAX_MS = 500;
 
-// --- turn drive (symmetric) ---
-const int32_t TURN_LEAD    = 6000;   // 180deg overshoot knob -- raise if it sails past 180.
-const int     CTR_STEER_US = 1800;
+// --- #1 PD TURN CONTROLLER gains ---
+const int32_t Kp_turn = 18;    // drive strength on remaining angle. Higher = harder/faster turn.
+const int32_t Kd_turn = 90;    // brake on rotation RATE. THIS kills overshoot. Raise if it still
+                               //   overshoots; lower if it stalls/creeps before reaching target.
+const int32_t TURN_DONE = 300; // within this many (x100) deg of target = turn complete (3.00 deg).
 
-// --- steering gains ---
+// --- steering gains (straight-line PI) ---
 const int32_t Kp = 30;
-// --- integral (I) term: cancels steady straight-line drift (tail-walk on the straights) ---
-const int32_t Ki          = 2;     // START LOW. Raise if drift persists; LOWER if it starts weaving.
-const int32_t I_CLAMP     = 8000;  // anti-windup: cap on the accumulated error sum.
-const int     I_OUT_CLAMP = 600;   // safety cap on rudder offset (us) the I term can ever apply.
+const int32_t Ki          = 2;
+const int32_t I_CLAMP     = 8000;
+const int     I_OUT_CLAMP = 600;
 // =============================
 
 int32_t yaw = 0;
@@ -70,12 +79,20 @@ uint32_t straightenStart = 0;
 uint32_t scanStart = 0;
 uint32_t turnStart = 0;
 
-int32_t yawIntegral = 0;   // accumulated heading error -- straight-line states ONLY
+int32_t yawIntegral = 0;
 
 // scan state
 int scanPhase = 0;
 uint8_t scanArmed = 0;
 int32_t leftOpen = 0, rightOpen = 0;
+
+// stuck-detect state
+uint32_t stuckStart = 0;
+int32_t  stuckRefDist = 0;
+uint8_t  stuckArmed = 0;
+
+// most-recent gyro rate, shared into EXECUTE_TURN for the D term
+int32_t gz_scaled_global = 0;
 
 // ================= Ultrasonic via INT0 (PD2), non-blocking timing =================
 volatile uint32_t timer0_overflows = 0;
@@ -173,7 +190,7 @@ void MPU6050_init(){ MPU6050_write(0x6B,0x00); }
 
 int16_t read_gyro_z_raw() {
   int16_t z_raw = (MPU6050_read(0x47) << 8) | MPU6050_read(0x48);
-  return z_raw * -1;
+  return z_raw * 1;
 }
 
 void calculate_IMU_error() {
@@ -200,7 +217,7 @@ int32_t read_open(void) {
     return a + b + c - hi - lo;
 }
 
-// Servo physically rotated 180deg -> mirror the commanded pulse about center before output.
+// Servo physically rotated 180deg -> mirror commanded pulse about center before output.
 ISR(TIMER1_COMPA_vect){ OCR1A = 2 * SERVO_CENTER_US - servoPulseWidth; }
 
 // ---------- States ----------
@@ -256,6 +273,7 @@ int main(void) {
     while(1) {
         int16_t gz_raw = read_gyro_z_raw();
         int32_t gz_scaled = ((int32_t)gz_raw * 100) / 131;
+        gz_scaled_global = gz_scaled;          // share rate into the PD turn
 
         previousTime = currentTime;
         currentTime = get_millis();
@@ -297,6 +315,7 @@ int main(void) {
 
                 if (abs(servoPulseWidth - SERVO_CENTER_US) < 200 && wallNear) {
                     lastGoodDist = 999;
+                    stuckArmed = 0;            // reset stuck-detect when entering approach normally
                     systemState = APPROACH;
                 }
                 break;
@@ -330,8 +349,35 @@ int main(void) {
                     (frontDist > 0 && frontDist < TURN_CM) ||
                     (frontDist == 0 && lastGoodDist2 < TURN_CM);
 
-                if (atWall) {
+                // ---- #2 STUCK-AT-WALL escape ----
+                // If close to a wall and the front distance isn't changing for STUCK_MS, the
+                // craft is pinned (rudder straight, not progressing). Force the turn.
+                uint8_t closeBand =
+                    (frontDist > 0 && frontDist < STUCK_CM) ||
+                    (frontDist == 0 && lastGoodDist2 < STUCK_CM);
+                uint8_t forcedStuck = 0;
+                if (closeBand) {
+                    if (!stuckArmed) {
+                        stuckArmed = 1;
+                        stuckStart = get_millis();
+                        stuckRefDist = (frontDist > 0) ? frontDist : lastGoodDist2;
+                    } else {
+                        int32_t cur = (frontDist > 0) ? frontDist : lastGoodDist2;
+                        if (labs((long)(cur - stuckRefDist)) > STUCK_DELTA) {
+                            // distance is changing -> making progress, re-arm the timer
+                            stuckStart = get_millis();
+                            stuckRefDist = cur;
+                        } else if (get_millis() - stuckStart >= STUCK_MS) {
+                            forcedStuck = 1;     // stuck too long -> force the turn
+                        }
+                    }
+                } else {
+                    stuckArmed = 0;
+                }
+
+                if (atWall || forcedStuck) {
                     lastGoodDist2 = 999;
+                    stuckArmed = 0;
                     scanPhase = 0;
                     scanArmed = 0;
                     scanStart = get_millis();
@@ -366,7 +412,7 @@ int main(void) {
                             if (leftOpen > rightOpen) turnDirection = -1;
                             else                      turnDirection = 1;
 
-                            targetYaw += (18000 * turnDirection);   // 18000 = 180.00 degrees
+                            targetYaw += (9000 * turnDirection);   // 9000 = 90.00 degrees
                             targetPulse = SERVO_CENTER_US;
                             scanArmed = 0;
                             turnStart = get_millis();
@@ -376,43 +422,35 @@ int main(void) {
                 }
                 break;
 
-            case EXECUTE_TURN:
+            case EXECUTE_TURN: {
+                // ---- #1 PD TURN CONTROLLER ----
+                // Drive on remaining angle, brake on rotation rate. As yaw nears targetYaw the
+                // P term shrinks; the D term (gyro rate) subtracts hard while spinning fast, so
+                // it eases into the target instead of slamming full-throw then overshooting.
                 OCR0A = FAN_DIR_FULL;
                 OCR0B = FAN_LIFT_TURN;
 
-                if (turnDirection == 1) {                          // RIGHT
-                    if (yaw < targetYaw - TURN_LEAD)
-                        targetPulse = SERVO_RIGHT_US;
-                    else
-                        targetPulse = SERVO_CENTER_US - CTR_STEER_US;
+                int32_t remaining = targetYaw - yaw;          // signed: + means need more CW(right)
+                // PD output as a rudder offset from center.
+                int32_t pTerm = (remaining * Kp_turn) / 100;
+                int32_t dTerm = (gz_scaled_global * Kd_turn) / 100;
+                int32_t turnCmd = pTerm - dTerm;              // brake against current spin rate
 
-                    if (yaw >= targetYaw) {
-                        OCR0B = FAN_LIFT_90;
-                        yawIntegral = 0;
-                        straightenStart = get_millis();
-                        systemState = STRAIGHTEN;
-                    }
-                } else {                                           // LEFT (mirror)
-                    if (yaw > targetYaw + TURN_LEAD)
-                        targetPulse = SERVO_LEFT_US;
-                    else
-                        targetPulse = SERVO_CENTER_US + CTR_STEER_US;
+                int newPulse = SERVO_CENTER_US + (int)turnCmd;
+                if (newPulse < SERVO_LEFT_US)  newPulse = SERVO_LEFT_US;
+                if (newPulse > SERVO_RIGHT_US) newPulse = SERVO_RIGHT_US;
+                targetPulse = newPulse;
 
-                    if (yaw <= targetYaw) {
-                        OCR0B = FAN_LIFT_90;
-                        yawIntegral = 0;
-                        straightenStart = get_millis();
-                        systemState = STRAIGHTEN;
-                    }
-                }
-
-                if (get_millis() - turnStart >= TURN_MAX_MS) {
+                // done when within TURN_DONE of target (either direction), or timeout escape.
+                if (labs((long)remaining) <= TURN_DONE ||
+                    (get_millis() - turnStart >= TURN_MAX_MS)) {
                     OCR0B = FAN_LIFT_90;
                     yawIntegral = 0;
                     straightenStart = get_millis();
                     systemState = STRAIGHTEN;
                 }
                 break;
+            }
 
             case STRAIGHTEN: {
                 OCR0A = FAN_DIR_SLOW;
@@ -450,7 +488,6 @@ int main(void) {
         } else {
             servoPulseWidth = targetPulse;
         }
-        // Servo physically rotated 180deg -> mirror the commanded pulse about center.
         OCR1A = 2 * SERVO_CENTER_US - servoPulseWidth;
 
         _delay_ms(40);
