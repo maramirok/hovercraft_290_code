@@ -1,17 +1,14 @@
 /*
   Hovercraft Control: "The Navigator" (PURE C VERSION)
-  TURN UPGRADE v20: PD ANTI-RAM APPROACH. APPROACH thrust is no longer a hard step to a fixed
-  slow value -- it's a PD on distance-to-wall:
-     P: thrust ramps DOWN linearly as the wall nears (FAN_DIR_FULL at SLOW_CM -> FAN_DIR_SLOW at TURN_CM)
-     D: brakes harder the FASTER the craft is closing on the wall (rate frontDist shrinks, smoothed)
-  So it slows smoothly and brakes hard on a fast approach instead of ramming. Keeps #1 PD turn,
-  #2 stuck-at-wall escape, 90deg symmetric turns, servo mirror, PI straight-line steering, INT0.
-  NOTE: there is no true speed sensor; "speed" here is closing-rate toward the wall from the US.
-*/
+  TURN UPGRADE v21: Post-turn SETTLE deflation. When a turn completes, the craft now deflates
+  HARD with thrust cut for a brief moment so floor friction kills any residual spin, THEN
+  re-inflates and proceeds to STRAIGHTEN. Flow: EXECUTE_TURN -> SETTLE -> STRAIGHTEN -> CRUISE.
+  Keeps: #1 PD turn, #PD anti-ram approach, #2 stuck-at-wall escape, 90deg symmetric turns,
+  servo mirror, PI straight-line steering, INT0 ultrasonic.
 
-// original kd_speed: 100
-//original kp turn: 18
-//original kd turn : 90
+  NOTE: the four tuning constants below (FAN_DIR_FULL, Kp_turn, Kd_turn, Kd_speed) use the v20
+  baseline. If you hand-tuned different values, restore them -- they're marked <<< TUNE.
+*/
 
 #define F_CPU 16000000UL
 
@@ -38,7 +35,7 @@ const int SERVO_SPEED = 150;
 volatile uint32_t timer0_millis = 0;
 
 #define MPU6050_ADDR 0x68
-const int FAN_DIR_FULL = 255;
+const int FAN_DIR_FULL = 255;   // <<< TUNE: thrust ceiling (you may have capped this at 90)
 const int FAN_LIFT_90  = 230;
 const int FAN_STOP = 0;
 
@@ -48,15 +45,18 @@ const uint32_t SCAN_SETTLE_MS = 200;
 const uint32_t SCAN_MAX_MS    = 1500;
 const uint32_t TURN_MAX_MS    = 3000;
 
+// --- post-turn SETTLE: brief hard deflation to let floor friction kill residual spin ---
+const int      FAN_LIFT_SETTLE = 30;   // deflate HARD to brake the spin. Lower = more friction; 0 = full cut.
+const uint32_t SETTLE_MS       = 250;  // how long to grind off leftover rotation before re-inflating
+
 // --- two-stage wall trigger (also the PD-approach ramp endpoints) ---
-const int32_t SLOW_CM      = 45;     // ramp FAR end: at/above this, approach thrust = full
-const int32_t TURN_CM      = 28;     // ramp NEAR end + turn commit: at/below this, thrust = FAN_DIR_SLOW
-const int     FAN_DIR_SLOW = 110;    // ramp floor (P term) + STRAIGHTEN creep thrust
+const int32_t SLOW_CM      = 45;
+const int32_t TURN_CM      = 28;
+const int     FAN_DIR_SLOW = 110;   // must stay BELOW FAN_DIR_FULL
 
 // --- #PD ANTI-RAM approach ---
-const int32_t Kd_speed   = 300;  // closing-rate brake gain. Higher = brakes harder on a fast approach.
-                                 //   raise if it still rams; lower if it brakes too eagerly / crawls early.
-const int     FAN_DIR_MIN = 85;  // absolute thrust floor after braking (keep some creep + steering air).
+const int32_t Kd_speed   = 150;  // <<< TUNE: closing-rate brake gain (raise for harder approach braking)
+const int     FAN_DIR_MIN = 85;  // brake floor (must stay below FAN_DIR_SLOW)
 
 // --- #2 STUCK-AT-WALL escape ---
 const int32_t STUCK_CM      = 32;
@@ -67,9 +67,9 @@ const uint32_t STUCK_MS     = 900;
 const uint32_t STRAIGHTEN_MAX_MS = 500;
 
 // --- #1 PD TURN CONTROLLER gains ---
-const int32_t Kp_turn = 9;
-const int32_t Kd_turn = 150;
-const int32_t TURN_DONE = 300;   // within 3.00 deg of target = turn complete
+const int32_t Kp_turn = 18;    // <<< TUNE: turn drive strength (lower = gentler turn)
+const int32_t Kd_turn = 90;    // <<< TUNE: turn rate-brake (higher = less overshoot)
+const int32_t TURN_DONE = 300; // within 3.00 deg of target = turn complete
 
 // --- steering gains (straight-line PI) ---
 const int32_t Kp = 30;
@@ -85,6 +85,7 @@ uint32_t settleStart = 0;
 uint32_t straightenStart = 0;
 uint32_t scanStart = 0;
 uint32_t turnStart = 0;
+uint32_t brakeStart = 0;       // SETTLE-phase timer
 
 int32_t yawIntegral = 0;
 
@@ -103,7 +104,7 @@ int32_t gz_scaled_global = 0;
 
 // PD approach: closing-rate tracking
 int32_t prevFrontDist = 999;
-int32_t closingFilt = 0;     // smoothed closing rate (cm/s); + = approaching the wall
+int32_t closingFilt = 0;
 
 // ================= Ultrasonic via INT0 (PD2), non-blocking timing =================
 volatile uint32_t timer0_overflows = 0;
@@ -237,7 +238,8 @@ enum SystemState {
   APPROACH     = 1,
   SCAN_SIDES   = 2,
   EXECUTE_TURN = 3,
-  STRAIGHTEN   = 4
+  SETTLE       = 4,   // brief deflation to kill residual spin after a turn
+  STRAIGHTEN   = 5
 };
 SystemState systemState = CRUISE;
 
@@ -294,13 +296,11 @@ int main(void) {
 
         int32_t frontDist = us_sensor_get_distance();
 
-        // ---- closing-rate toward a wall ahead (cm/s, smoothed). Valid only between two real
-        //      consecutive readings; else 0 so we never brake on a no-echo glitch. ----
         int32_t closingRaw = 0;
         if (frontDist > 0 && prevFrontDist > 0 && delta_t > 0) {
-            closingRaw = ((prevFrontDist - frontDist) * 1000L) / (int32_t)delta_t; // + = approaching
+            closingRaw = ((prevFrontDist - frontDist) * 1000L) / (int32_t)delta_t;
         }
-        closingFilt = (closingFilt * 3 + closingRaw) / 4;   // light low-pass vs US jitter
+        closingFilt = (closingFilt * 3 + closingRaw) / 4;
         prevFrontDist = frontDist;
 
         switch(systemState){
@@ -342,13 +342,11 @@ int main(void) {
             }
 
             case APPROACH: {
-                // ---- #PD ANTI-RAM: thrust = P(distance ramp) - D(closing rate) ----
                 static int32_t lastGoodDist2 = 999;
                 if (frontDist > 0) lastGoodDist2 = frontDist;
 
                 int32_t distForRamp = (frontDist > 0) ? frontDist : lastGoodDist2;
 
-                // P: linear ramp from FAN_DIR_FULL (at/beyond SLOW_CM) down to FAN_DIR_SLOW (at TURN_CM)
                 int32_t pThrust;
                 if (distForRamp >= SLOW_CM)      pThrust = FAN_DIR_FULL;
                 else if (distForRamp <= TURN_CM) pThrust = FAN_DIR_SLOW;
@@ -356,17 +354,15 @@ int main(void) {
                         ((int32_t)(FAN_DIR_FULL - FAN_DIR_SLOW) * (distForRamp - TURN_CM))
                         / (SLOW_CM - TURN_CM);
 
-                // D: brake proportional to closing rate (only when actually approaching)
                 int32_t dBrake = (closingFilt > 0) ? (Kd_speed * closingFilt) / 100 : 0;
 
                 int32_t cmdThrust = pThrust - dBrake;
                 if (cmdThrust > FAN_DIR_FULL) cmdThrust = FAN_DIR_FULL;
                 if (cmdThrust < FAN_DIR_MIN)  cmdThrust = FAN_DIR_MIN;
 
-                OCR0A = (uint8_t)cmdThrust;     // <-- smooth anti-ram thrust (replaces hard step)
+                OCR0A = (uint8_t)cmdThrust;
                 OCR0B = FAN_LIFT_90;
 
-                // steering (P+I) unchanged
                 int32_t error = targetYaw - yaw;
                 yawIntegral += (error * (int32_t)delta_t) / 1000;
                 if (yawIntegral >  I_CLAMP) yawIntegral =  I_CLAMP;
@@ -387,7 +383,6 @@ int main(void) {
                     (frontDist > 0 && frontDist < TURN_CM) ||
                     (frontDist == 0 && lastGoodDist2 < TURN_CM);
 
-                // #2 stuck-at-wall escape
                 uint8_t closeBand =
                     (frontDist > 0 && frontDist < STUCK_CM) ||
                     (frontDist == 0 && lastGoodDist2 < STUCK_CM);
@@ -474,13 +469,26 @@ int main(void) {
 
                 if (labs((long)remaining) <= TURN_DONE ||
                     (get_millis() - turnStart >= TURN_MAX_MS)) {
-                    OCR0B = FAN_LIFT_90;
+                    // -> SETTLE: deflate to kill residual spin before straightening.
                     yawIntegral = 0;
+                    brakeStart = get_millis();
+                    systemState = SETTLE;
+                }
+                break;
+            }
+
+            case SETTLE:
+                // Turn just finished. Deflate HARD and cut thrust so floor friction kills any
+                // leftover spin, then re-inflate and hand off to STRAIGHTEN. Rudder centered.
+                OCR0A = FAN_STOP;
+                OCR0B = FAN_LIFT_SETTLE;
+                targetPulse = SERVO_CENTER_US;
+                if (get_millis() - brakeStart >= SETTLE_MS) {
+                    OCR0B = FAN_LIFT_90;          // re-inflate
                     straightenStart = get_millis();
                     systemState = STRAIGHTEN;
                 }
                 break;
-            }
 
             case STRAIGHTEN: {
                 OCR0A = FAN_DIR_SLOW;
