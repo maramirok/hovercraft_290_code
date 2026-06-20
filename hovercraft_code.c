@@ -1,13 +1,13 @@
 /*
   Hovercraft Control: "The Navigator" (PURE C VERSION)
-  TURN UPGRADE v21: Post-turn SETTLE deflation. When a turn completes, the craft now deflates
-  HARD with thrust cut for a brief moment so floor friction kills any residual spin, THEN
-  re-inflates and proceeds to STRAIGHTEN. Flow: EXECUTE_TURN -> SETTLE -> STRAIGHTEN -> CRUISE.
-  Keeps: #1 PD turn, #PD anti-ram approach, #2 stuck-at-wall escape, 90deg symmetric turns,
-  servo mirror, PI straight-line steering, INT0 ultrasonic.
+  TURN UPGRADE v22: Front bumper compensation. A 7cm shock-absorbing bumper now sticks out
+  front (sensor unchanged), so the craft's effective front edge is 7cm closer to the wall than
+  the sensor reads. Wall thresholds raised to stop/turn before the bumper loads against the wall:
+  SLOW_CM 45->52, TURN_CM 28->37 (+7 +2 margin), STUCK_CM 32->39.
+  Keeps: post-turn SETTLE deflation, #1 PD turn, #PD anti-ram approach, #2 stuck-escape,
+  90deg symmetric turns, servo mirror, PI straight-line steering, INT0 ultrasonic.
 
-  NOTE: the four tuning constants below (FAN_DIR_FULL, Kp_turn, Kd_turn, Kd_speed) use the v20
-  baseline. If you hand-tuned different values, restore them -- they're marked <<< TUNE.
+  NOTE: constants marked <<< TUNE use baseline values. If you hand-tuned them, restore yours.
 */
 
 #define F_CPU 16000000UL
@@ -35,7 +35,7 @@ const int SERVO_SPEED = 150;
 volatile uint32_t timer0_millis = 0;
 
 #define MPU6050_ADDR 0x68
-const int FAN_DIR_FULL = 255;   // <<< TUNE: thrust ceiling (you may have capped this at 90)
+const int FAN_DIR_FULL = 255;   // <<< TUNE: thrust ceiling (you may have capped this)
 const int FAN_LIFT_90  = 230;
 const int FAN_STOP = 0;
 
@@ -46,20 +46,20 @@ const uint32_t SCAN_MAX_MS    = 1500;
 const uint32_t TURN_MAX_MS    = 3000;
 
 // --- post-turn SETTLE: brief hard deflation to let floor friction kill residual spin ---
-const int      FAN_LIFT_SETTLE = 30;   // deflate HARD to brake the spin. Lower = more friction; 0 = full cut.
-const uint32_t SETTLE_MS       = 250;  // how long to grind off leftover rotation before re-inflating
+const int      FAN_LIFT_SETTLE = 30;
+const uint32_t SETTLE_MS       = 250;
 
-// --- two-stage wall trigger (also the PD-approach ramp endpoints) ---
-const int32_t SLOW_CM      = 45;
-const int32_t TURN_CM      = 28;
+// --- two-stage wall trigger (RAISED for the 7cm front bumper) ---
+const int32_t SLOW_CM      = 50;    // was 45: +7 for the bumper (start slowing sooner)
+const int32_t TURN_CM      = 35;    // was 28: +7 bumper +2 margin (commit before bumper loads up)
 const int     FAN_DIR_SLOW = 110;   // must stay BELOW FAN_DIR_FULL
 
 // --- #PD ANTI-RAM approach ---
-const int32_t Kd_speed   = 150;  // <<< TUNE: closing-rate brake gain (raise for harder approach braking)
+const int32_t Kd_speed   = 150;  // <<< TUNE: closing-rate brake gain
 const int     FAN_DIR_MIN = 85;  // brake floor (must stay below FAN_DIR_SLOW)
 
 // --- #2 STUCK-AT-WALL escape ---
-const int32_t STUCK_CM      = 32;
+const int32_t STUCK_CM      = 37;   // was 32: +7 to track the bumper geometry
 const int32_t STUCK_DELTA   = 3;
 const uint32_t STUCK_MS     = 900;
 
@@ -67,8 +67,8 @@ const uint32_t STUCK_MS     = 900;
 const uint32_t STRAIGHTEN_MAX_MS = 500;
 
 // --- #1 PD TURN CONTROLLER gains ---
-const int32_t Kp_turn = 18;    // <<< TUNE: turn drive strength (lower = gentler turn)
-const int32_t Kd_turn = 90;    // <<< TUNE: turn rate-brake (higher = less overshoot)
+const int32_t Kp_turn = 18;    // <<< TUNE: turn drive strength
+const int32_t Kd_turn = 90;    // <<< TUNE: turn rate-brake
 const int32_t TURN_DONE = 300; // within 3.00 deg of target = turn complete
 
 // --- steering gains (straight-line PI) ---
@@ -85,7 +85,7 @@ uint32_t settleStart = 0;
 uint32_t straightenStart = 0;
 uint32_t scanStart = 0;
 uint32_t turnStart = 0;
-uint32_t brakeStart = 0;       // SETTLE-phase timer
+uint32_t brakeStart = 0;
 
 int32_t yawIntegral = 0;
 
@@ -453,7 +453,6 @@ int main(void) {
                 break;
 
             case EXECUTE_TURN: {
-                // #1 PD TURN: drive on remaining angle, brake on rotation rate.
                 OCR0A = FAN_DIR_FULL;
                 OCR0B = FAN_LIFT_TURN;
 
@@ -469,7 +468,6 @@ int main(void) {
 
                 if (labs((long)remaining) <= TURN_DONE ||
                     (get_millis() - turnStart >= TURN_MAX_MS)) {
-                    // -> SETTLE: deflate to kill residual spin before straightening.
                     yawIntegral = 0;
                     brakeStart = get_millis();
                     systemState = SETTLE;
@@ -478,13 +476,13 @@ int main(void) {
             }
 
             case SETTLE:
-                // Turn just finished. Deflate HARD and cut thrust so floor friction kills any
-                // leftover spin, then re-inflate and hand off to STRAIGHTEN. Rudder centered.
+                // Turn just finished. Deflate HARD + cut thrust so floor friction kills leftover
+                // spin, then re-inflate and hand to STRAIGHTEN. Rudder centered.
                 OCR0A = FAN_STOP;
                 OCR0B = FAN_LIFT_SETTLE;
                 targetPulse = SERVO_CENTER_US;
                 if (get_millis() - brakeStart >= SETTLE_MS) {
-                    OCR0B = FAN_LIFT_90;          // re-inflate
+                    OCR0B = FAN_LIFT_90;
                     straightenStart = get_millis();
                     systemState = STRAIGHTEN;
                 }
